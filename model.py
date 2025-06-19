@@ -1,200 +1,156 @@
 import torch
 import torchaudio
-
-print(torch.__version__)
-print(torchaudio.__version__)
-
-import matplotlib.pyplot as plt
-from pytube import YouTube
-from moviepy.editor import VideoFileClip
-from IPython.display import Audio
-from torchaudio.pipelines import HDEMUCS_HIGH_MUSDB_PLUS
 import os
 import tempfile
-
-bundle = HDEMUCS_HIGH_MUSDB_PLUS
-model = bundle.get_model()
-
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-model.to(device)
-
-sample_rate = bundle.sample_rate
-print(f"Sample rate: {sample_rate}")
-
+import shutil
+import logging
+import yt_dlp
+from torchaudio.pipelines import HDEMUCS_HIGH_MUSDB_PLUS
 from torchaudio.transforms import Fade
 
-def download_youtube_video(url, output_path='.'):
+torchaudio.set_audio_backend("soundfile")  # or "sox_io"
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Load separation model and device
+bundle = HDEMUCS_HIGH_MUSDB_PLUS
+model = bundle.get_model()
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+sample_rate = bundle.sample_rate
+logger.info(f"Using sample rate: {sample_rate}, device: {device}")
+
+
+def download_youtube_audio(url, output_path="."):
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(output_path, "%(title)s.%(ext)s"),
+        "quiet": False,
+        "no_warnings": True,
+        "noplaylist": True,
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "wav",
+                "preferredquality": "192",
+            }
+        ],
+    }
     try:
-        yt = YouTube(url)
-        stream = yt.streams.filter(only_audio=False).first()  # Download video
-        file_path = stream.download(output_path=output_path)
-        return file_path
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            # The postprocessor changes extension to .wav
+            filename = ydl.prepare_filename(info)
+            audio_path = os.path.splitext(filename)[0] + ".wav"
+            logger.info(f"Downloaded and converted to WAV: {audio_path}")
+            return audio_path
     except Exception as e:
-        print(f"An error occurred while downloading the video: {e}")
+        logger.error(f"Download error: {e}")
         return None
 
-def extract_audio_from_video(video_path, audio_path):
-    try:
-        video = VideoFileClip(video_path)
-        video.audio.write_audiofile(audio_path)
-        video.close()  # Ensure you close the video clip to free up resources
-        return audio_path  # Return the path to the extracted audio on success
-    except Exception as e:
-        print(f"An error occurred while extracting audio: {e}")
-        return None
 
-def prompt_for_youtube_link():
-    while True:
-        url = input("Please enter the YouTube video URL: ")
-        if "youtube.com" in url or "youtu.be" in url:
-            return url
-        else:
-            print("Invalid YouTube URL. Please enter a valid YouTube video URL.")
-
-def separate_sources(
-    model,
-    mix,
-    segment=10.0,
-    overlap=0.1,
-    device=None,
-):
+def separate_sources(model, mix, segment=10.0, overlap=0.1, device=None):
     if device is None:
-        device = mix.device
-    else:
-        device = torch.device(device)
-
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch, channels, length = mix.shape
+    chunk_len = int(sample_rate * segment)
+    overlap_frames = int(sample_rate * overlap)
+    step = chunk_len - overlap_frames
 
-    chunk_len = int(sample_rate * segment * (1 + overlap))
-    start = 0
-    end = chunk_len
-    overlap_frames = overlap * sample_rate
-    fade = Fade(fade_in_len=0, fade_out_len=int(overlap_frames), fade_shape="linear")
+    fade_in = Fade(fade_in_len=overlap_frames, fade_out_len=0)
+    fade_out = Fade(fade_in_len=0, fade_out_len=overlap_frames)
 
     final = torch.zeros(batch, len(model.sources), channels, length, device=device)
 
-    while start < length - overlap_frames:
+    start = 0
+    while start < length:
+        end = min(start + chunk_len, length)
         chunk = mix[:, :, start:end]
+
         with torch.no_grad():
-            out = model.forward(chunk)
-        out = fade(out)
-        final[:, :, :, start:end] += out
+            out = model(chunk)
+
+        # Apply fades for smooth overlap-add
         if start == 0:
-            fade.fade_in_len = int(overlap_frames)
-            start += int(chunk_len - overlap_frames)
+            out = fade_out(out)
+        elif end == length:
+            out = fade_in(out)
         else:
-            start += chunk_len
-        end += chunk_len
-        if end >= length:
-            fade.fade_out_len = 0
+            out = fade_in(fade_out(out))
+
+        final[:, :, :, start:end] += out
+        start += step
+
     return final
 
-def plot_spectrogram(stft, title="Spectrogram"):
-    magnitude = stft.abs()
-    spectrogram = 20 * torch.log10(magnitude + 1e-8).numpy()
-    _, axis = plt.subplots(1, 1)
-    axis.imshow(spectrogram, cmap="viridis", vmin=-60, vmax=0, origin="lower", aspect="auto")
-    axis.set_title(title)
-    plt.tight_layout()
 
 def save_audio(tensor, sample_rate, file_path):
-    output_dir = os.path.dirname(file_path)
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
     torchaudio.save(file_path, tensor.cpu(), sample_rate)
-    print(f"Saved {file_path}")
+    logger.info(f"Saved: {file_path}")
 
-def clean_temporary_files(temp_dir):
+
+def clean_temp_dir(temp_dir):
     try:
-        for filename in os.listdir(temp_dir):
-            file_path = os.path.join(temp_dir, filename)
-            if os.path.isfile(file_path):
-                os.remove(file_path)
-                print(f"Deleted {file_path}")
-        os.rmdir(temp_dir)
-        print(f"Deleted temporary directory: {temp_dir}")
+        shutil.rmtree(temp_dir)
+        logger.info(f"Cleaned temporary directory: {temp_dir}")
     except Exception as e:
-        print(f"Failed to delete temporary files: {e}")
+        logger.error(f"Cleanup error: {e}")
 
-def create_unique_stems_directory(base_dir):
+
+def create_stems_dir(base_dir="separated_sources"):
     i = 0
     while True:
-        stems_dir = os.path.join(base_dir, f"stems" if i == 0 else f"stems ({i})")
-        if not os.path.exists(stems_dir):
-            os.makedirs(stems_dir)
-            return stems_dir
+        path = os.path.join(base_dir, "stems" if i == 0 else f"stems ({i})")
+        if not os.path.exists(path):
+            os.makedirs(path)
+            return path
         i += 1
 
-# Prompt user for YouTube video URL
-video_url = prompt_for_youtube_link()
 
-# Create a temporary directory to store downloaded files
-temp_dir = tempfile.mkdtemp(prefix='Temp_youtube_downloads_')
+def prompt_for_link():
+    while True:
+        url = input("Enter YouTube video URL: ").strip()
+        if "youtube.com" in url or "youtu.be" in url:
+            return url
+        logger.warning("Invalid URL, try again.")
 
-# Download the video file from YouTube
-SAMPLE_VIDEO_PATH = download_youtube_video(video_url, output_path=temp_dir)
-AUDIO_FILE_PATH = os.path.join(temp_dir, "audio.wav")
 
-if SAMPLE_VIDEO_PATH:
-    # Extract audio from the downloaded video
-    AUDIO_FILE_PATH = extract_audio_from_video(SAMPLE_VIDEO_PATH, AUDIO_FILE_PATH)
-    if AUDIO_FILE_PATH:
-        waveform, sample_rate = torchaudio.load(AUDIO_FILE_PATH)
-        waveform = waveform.to(device)
-        mixture = waveform
+if __name__ == "__main__":
+    video_url = prompt_for_link()
+    temp_dir = tempfile.mkdtemp(prefix="yt_temp_")
 
-        segment = 10
-        overlap = 0.1
+    audio_path = download_youtube_audio(video_url, output_path=temp_dir)
+    if not audio_path:
+        logger.error("Download failed. Exiting.")
+        clean_temp_dir(temp_dir)
+        exit(1)
 
-        print("Separating track")
+    waveform, sr = torchaudio.load(audio_path)
+    if sr != sample_rate:
+        logger.info(f"Resampling audio from {sr} to {sample_rate}")
+        resampler = torchaudio.transforms.Resample(sr, sample_rate)
+        waveform = resampler(waveform)
+    waveform = waveform.to(device)
 
-        ref = waveform.mean(0)
-        waveform = (waveform - ref.mean()) / ref.std()
+    # Normalize per channel
+    mean = waveform.mean(dim=1, keepdim=True)
+    std = waveform.std(dim=1, keepdim=True) + 1e-9
+    waveform_norm = (waveform - mean) / std
 
-        sources = separate_sources(
-            model,
-            waveform[None],
-            device=device,
-            segment=segment,
-            overlap=overlap,
-        )[0]
-        sources = sources * ref.std() + ref.mean()
+    logger.info("Separating sources...")
+    sources = separate_sources(model, waveform_norm[None], device=device)[0]
 
-        sources_list = model.sources
-        sources = list(sources)
+    # Denormalize sources
+    sources = sources * std.unsqueeze(0) + mean.unsqueeze(0)
 
-        audios = dict(zip(sources_list, sources))
+    audios = dict(zip(model.sources, list(sources)))
 
-        N_FFT = 4096
-        N_HOP = 4
-        stft = torchaudio.transforms.Spectrogram(
-            n_fft=N_FFT,
-            hop_length=N_HOP,
-            power=None,
-        )
+    out_dir = create_stems_dir()
+    for name, audio in audios.items():
+        save_audio(audio.squeeze(0), sample_rate, os.path.join(out_dir, f"{name}.wav"))
 
-        def output_results(predicted_source: torch.Tensor, source: str):
-            plot_spectrogram(stft(predicted_source)[0], f"Spectrogram - {source}")
-            return Audio(predicted_source, rate=sample_rate)
-
-        segment_start = 150
-        segment_end = 155
-
-        frame_start = segment_start * sample_rate
-        frame_end = segment_end * sample_rate
-
-        # Create a unique stems directory
-        output_dir = "separated_sources"
-        stems_dir = create_unique_stems_directory(output_dir)
-
-        for source_name, source_audio in audios.items():
-            save_path = os.path.join(stems_dir, f"{source_name}.wav")
-            save_audio(source_audio.squeeze(0), sample_rate, save_path)
-
-        # Clean up: delete the downloaded MP3 and MP4 files
-        clean_temporary_files(temp_dir)
-
-    else:
-        print("Failed to extract audio from the video.")
-else:
-    print("Failed to download the video.")
-
+    clean_temp_dir(temp_dir)
+    logger.info("Done! Check your separated stems folder.")
