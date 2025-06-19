@@ -41,3 +41,6 @@ Bash
 acaload
 Enter YouTube video URL: https://...
 ```
+### License
+
+This project is licensed under the [GNU General Public License v3.0 (GPLv3)](https://www.gnu.org/licenses/gpl-3.0.html) - see the [LICENSE](LICENSE) file for details.
