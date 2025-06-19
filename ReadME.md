@@ -3,6 +3,7 @@
 [![Python](https://img.shields.io/badge/Python-3.13-blue?style=flat&labelColor=gray)](https://www.python.org/downloads/release/python-3130/)
 [![yt_dlp](https://img.shields.io/badge/yt_dlp-2025.06.09-FF0000?style=flat&labelColor=gray)](https://github.com/yt-dlp/yt-dlp)
 [![Torch](https://img.shields.io/badge/PyTorch-2.7.0-EF4B2F?style=flat&labelColor=gray&logo=pytorch&logoColor=white)](https://pytorch.org/)
+![Python CI](https://github.com/Ayoubmanjoura/acaload/actions/workflows/python-ci.yml/badge.svg)
 
 Acaload is an open-source project designed to locally extract the stems of any song directly from YouTube using AI — no uploads, no shady servers.
 
