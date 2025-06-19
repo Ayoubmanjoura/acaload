@@ -11,11 +11,7 @@ setup(
     ],
     entry_points={
         "console_scripts": [
-            "acaload=model:main",  # assumes your script has a `main()` entry
-        ]
+            "acaload=model:main",
+        ],
     },
-    classifiers=[
-        "Programming Language :: Python :: 3",
-        "Operating System :: OS Independent",
-    ],
 )

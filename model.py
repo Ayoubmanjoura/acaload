@@ -5,21 +5,23 @@ import tempfile
 import shutil
 import logging
 import yt_dlp
+import argparse
 from torchaudio.pipelines import HDEMUCS_HIGH_MUSDB_PLUS
 from torchaudio.transforms import Fade
 
-torchaudio.set_audio_backend("soundfile")  # or "sox_io"
+# Use "soundfile" backend (required for WAV saving/loading)
+torchaudio.set_audio_backend("soundfile")
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load separation model and device
+# Load model and setup device
 bundle = HDEMUCS_HIGH_MUSDB_PLUS
 model = bundle.get_model()
+sample_rate = bundle.sample_rate
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
-sample_rate = bundle.sample_rate
 logger.info(f"Using sample rate: {sample_rate}, device: {device}")
 
 
@@ -41,7 +43,6 @@ def download_youtube_audio(url, output_path="."):
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            # The postprocessor changes extension to .wav
             filename = ydl.prepare_filename(info)
             audio_path = os.path.splitext(filename)[0] + ".wav"
             logger.info(f"Downloaded and converted to WAV: {audio_path}")
@@ -52,8 +53,7 @@ def download_youtube_audio(url, output_path="."):
 
 
 def separate_sources(model, mix, segment=10.0, overlap=0.1, device=None):
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = mix.device if device is None else torch.device(device)
     batch, channels, length = mix.shape
     chunk_len = int(sample_rate * segment)
     overlap_frames = int(sample_rate * overlap)
@@ -72,7 +72,7 @@ def separate_sources(model, mix, segment=10.0, overlap=0.1, device=None):
         with torch.no_grad():
             out = model(chunk)
 
-        # Apply fades for smooth overlap-add
+        # Smooth transitions
         if start == 0:
             out = fade_out(out)
         elif end == length:
@@ -118,8 +118,14 @@ def prompt_for_link():
         logger.warning("Invalid URL, try again.")
 
 
-if __name__ == "__main__":
-    video_url = prompt_for_link()
+def main():
+    parser = argparse.ArgumentParser(
+        description="Acaload - Extract stems from YouTube audio."
+    )
+    parser.add_argument("url", nargs="?", help="YouTube video URL")
+    args = parser.parse_args()
+
+    video_url = args.url or prompt_for_link()
     temp_dir = tempfile.mkdtemp(prefix="yt_temp_")
 
     audio_path = download_youtube_audio(video_url, output_path=temp_dir)
@@ -135,7 +141,7 @@ if __name__ == "__main__":
         waveform = resampler(waveform)
     waveform = waveform.to(device)
 
-    # Normalize per channel
+    # Normalize
     mean = waveform.mean(dim=1, keepdim=True)
     std = waveform.std(dim=1, keepdim=True) + 1e-9
     waveform_norm = (waveform - mean) / std
@@ -143,9 +149,8 @@ if __name__ == "__main__":
     logger.info("Separating sources...")
     sources = separate_sources(model, waveform_norm[None], device=device)[0]
 
-    # Denormalize sources
+    # Denormalize
     sources = sources * std.unsqueeze(0) + mean.unsqueeze(0)
-
     audios = dict(zip(model.sources, list(sources)))
 
     out_dir = create_stems_dir()
@@ -153,4 +158,8 @@ if __name__ == "__main__":
         save_audio(audio.squeeze(0), sample_rate, os.path.join(out_dir, f"{name}.wav"))
 
     clean_temp_dir(temp_dir)
-    logger.info("Done! Check your separated stems folder.")
+    logger.info("✅ Done! Check your separated stems in the folder.")
+
+
+if __name__ == "__main__":
+    main()
